@@ -96,6 +96,16 @@ class LaneFollowerNode(Node):
         self.pid = PIDController(kp=0.005, ki=0.0, kd=0.002)
         self.get_logger().info("✅ Lane follower with real-time control initialized.")
 
+    def filter_mask(self, mask):
+        """
+        Remove top half and small noise blobs to reduce false positives.
+        """
+        h, w = mask.shape
+        mask[:int(h * 0.5), :] = 0
+        kernel = np.ones((5, 5), np.uint8)
+        filtered = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+        return filtered
+
     def image_callback(self, msg):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -108,7 +118,9 @@ class LaneFollowerNode(Node):
 
         with torch.no_grad():
             pred = self.model(tensor).squeeze().cpu().numpy()
-        mask = (pred > 0.4).astype(np.uint8)
+
+        raw_mask = (pred > 0.4).astype(np.uint8)
+        mask = self.filter_mask(raw_mask)
 
         M = cv2.moments(mask)
         if M["m00"] > 0:
