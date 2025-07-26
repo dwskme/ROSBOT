@@ -1,0 +1,160 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+import torch
+import torch.nn as nn
+import cv2
+import numpy as np
+from torchvision import transforms
+import os
+import time
+
+
+class UNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        def CBR(in_ch, out_ch):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True)
+            )
+
+        self.enc1 = CBR(3, 64)
+        self.enc2 = CBR(64, 128)
+        self.enc3 = CBR(128, 256)
+        self.pool = nn.MaxPool2d(2)
+        self.dec2 = CBR(256 + 128, 128)
+        self.dec1 = CBR(128 + 64, 64)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.final = nn.Conv2d(64, 1, 1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        d2 = self.up(e3)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        return torch.sigmoid(self.final(d1))
+
+
+class PIDController:
+    def __init__(self, kp, ki, kd):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.last_time = time.time()
+
+    def update(self, error):
+        now = time.time()
+        dt = now - self.last_time if self.last_time else 0.1
+
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
+        output = self.kp * error + self.ki * self.integral + self.kd * derivative
+
+        self.prev_error = error
+        self.last_time = now
+        return output
+
+
+class LaneFollowerNode(Node):
+    def __init__(self):
+        super().__init__('lane_follower_node')
+        self.bridge = CvBridge()
+        self.subscription = self.create_subscription(Image, '/camera/color/image_raw', self.image_callback, 10)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.debug_pub = self.create_publisher(Image, '/lane_debug', 10)
+
+        # Load model
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = UNet().to(self.device)
+        model_path = os.path.join(os.path.dirname(__file__), 'lane_unet.pth')
+
+        if not os.path.exists(model_path):
+            self.get_logger().error(f"❌ Model file not found: {model_path}")
+            rclpy.shutdown()
+            return
+
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.eval()
+
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+        self.pid = PIDController(kp=0.005, ki=0.0, kd=0.002)
+        self.get_logger().info("✅ Lane follower with real-time control initialized.")
+
+    def image_callback(self, msg):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f"Image error: {e}")
+            return
+
+        resized = cv2.resize(frame, (256, 256))
+        tensor = self.transform(resized).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            pred = self.model(tensor).squeeze().cpu().numpy()
+        mask = (pred > 0.4).astype(np.uint8)
+
+        M = cv2.moments(mask)
+        if M["m00"] > 0:
+            cx = int(M["m10"] / M["m00"])
+            deviation = cx - 128  # center of 256x256
+            angular_z = -self.pid.update(deviation)
+            linear_x = 0.15
+            self.get_logger().info(f"📍 Lane deviation={deviation}, angular={angular_z:.3f}")
+        else:
+            angular_z = 0.0
+            linear_x = 0.0
+            self.get_logger().warn("⚠️ No lane detected. Stopping.")
+
+        self.publish_cmd(linear_x, angular_z)
+
+        # Visualization
+        color_mask = cv2.applyColorMap(mask * 255, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(resized, 0.7, color_mask, 0.3, 0)
+        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        overlay_rgb = np.ascontiguousarray(overlay_rgb)
+        debug_msg = self.bridge.cv2_to_imgmsg(overlay_rgb, encoding="rgb8")
+        self.debug_pub.publish(debug_msg)
+
+    def publish_cmd(self, lin, ang):
+        twist = Twist()
+        twist.linear.x = lin
+        twist.angular.z = ang
+        self.cmd_pub.publish(twist)
+
+    def stop_bot(self):
+        self.publish_cmd(0.0, 0.0)
+        self.get_logger().info("🛑 Bot stopped on shutdown.")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LaneFollowerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("🔻 Ctrl+C received.")
+    finally:
+        node.stop_bot()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
